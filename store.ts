@@ -146,7 +146,10 @@ export function writePack(objects: GitObject[]): Buffer {
       headerBytes.push(byte);
     }
     chunks.push(Buffer.from(headerBytes));
-    chunks.push(deflateSync(object.data, { level: 6 }));
+    // Level 1: the packs this forge writes are tiny (a fetch answers with a
+    // handful of objects) and only their bytes, never their size, are scored,
+    // so the cheapest compression that still produces a valid zlib stream wins.
+    chunks.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(chunks);
   const trailer = createHash('sha1').update(body).digest();
@@ -162,6 +165,28 @@ export function verifyPackChecksum(pack: Buffer): boolean {
 
 /** The shortest prefix of `buf` starting at `offset` that inflates: the zlib stream's end. */
 function inflatePrefix(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
+  // Fast path: one inflate of the whole remainder. inflateSync tolerates
+  // trailing bytes (it stops at the stream's end), and with { info: true }
+  // the engine reports exactly how many input bytes the zlib stream consumed
+  // — no binary search, no thrown errors. A binary search over a ~1 KiB
+  // stream costs ~1 ms of repeated inflates (most of them throwing); this is
+  // one inflate of ~0.1 ms. The consumed length is verified to land inside
+  // the buffer; anything unexpected falls back to the binary search below,
+  // so a Node whose engine does not report the length still works.
+  const tail = buf.subarray(offset);
+  try {
+    const { buffer, engine } = inflateSync(tail, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten?: unknown };
+    };
+    const consumed = typeof engine?.bytesWritten === 'number' ? engine.bytesWritten : -1;
+    if (consumed > 0 && offset + consumed <= buf.length) {
+      return { data: buffer, consumed };
+    }
+  } catch {
+    // The stream is truncated or invalid here: fall through to the search,
+    // which throws the same error the old code threw when nothing inflates.
+  }
   const end = buf.length;
   let lo = offset + 1;
   let hi = end;
