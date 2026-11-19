@@ -85,6 +85,17 @@ function sendBytes(res: ServerResponse, status: number, body: Buffer, contentTyp
   res.end(body);
 }
 
+/** Send a JSON body already serialized (with its trailing newline). */
+function sendPrebuiltJson(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
 function notFound(res: ServerResponse, message = 'Not Found'): void {
   sendJson(res, 404, { message });
 }
@@ -117,16 +128,41 @@ function parseJsonBody(body: Buffer): { ok: true; value: Record<string, unknown>
   }
 }
 
-function urlOf(req: IncomingMessage): URL {
+interface RequestTarget {
+  pathname: string;
+  segments: string[];
+  searchParams: URLSearchParams;
+}
+
+/**
+ * Parse the request target. The hot paths (issue read/write, git) carry
+ * plain absolute paths with no query string and no escapes, so they take a
+ * fast path of plain string splits instead of the URL parser; anything with
+ * a query string or an escape falls back to `new URL`, which is the exact
+ * behaviour the old code had for every request.
+ */
+function parseTarget(req: IncomingMessage): RequestTarget {
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const path = q < 0 ? raw : raw.slice(0, q);
+  if (path.indexOf('%') < 0) {
+    const segments = path.split('/').filter((part) => part !== '');
+    const searchParams = q < 0 ? new URLSearchParams() : new URL(raw, 'http://entry').searchParams;
+    return { pathname: path === '' ? '/' : path, segments, searchParams };
+  }
   try {
-    return new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
+    return { pathname: url.pathname, segments: pathSegments(url), searchParams: url.searchParams };
   } catch {
-    return new URL('/', 'http://entry');
+    return { pathname: '/', segments: [], searchParams: new URLSearchParams() };
   }
 }
 
 function pathSegments(url: URL): string[] {
   return url.pathname.split('/').filter((part) => part !== '').map((part) => {
+    // Most segments carry no escapes; decodeURIComponent is only needed when
+    // one does. The fast check keeps the hot REST paths off the slow path.
+    if (part.indexOf('%') < 0) return part;
     try {
       return decodeURIComponent(part);
     } catch {
@@ -135,27 +171,27 @@ function pathSegments(url: URL): string[] {
   });
 }
 
-function queryInt(url: URL, name: string, fallback: number): number {
-  const raw = url.searchParams.get(name);
+function queryInt(target: RequestTarget, name: string, fallback: number): number {
+  const raw = target.searchParams.get(name);
   if (raw === null) return fallback;
   const value = parseInt(raw, 10);
   return Number.isFinite(value) ? value : fallback;
 }
 
-function pageParams(url: URL): { perPage: number; page: number } {
-  const perPage = Math.min(100, Math.max(1, queryInt(url, 'per_page', 30)));
-  const page = Math.max(1, queryInt(url, 'page', 1));
+function pageParams(target: RequestTarget): { perPage: number; page: number } {
+  const perPage = Math.min(100, Math.max(1, queryInt(target, 'per_page', 30)));
+  const page = Math.max(1, queryInt(target, 'page', 1));
   return { perPage, page };
 }
 
 /** Paginate `items`; returns the page plus a Link header value (or ''). */
-function paginate<T>(req: IncomingMessage, url: URL, items: T[]): { page: T[]; link: string } {
-  const { perPage, page } = pageParams(url);
+function paginate<T>(req: IncomingMessage, target: RequestTarget, items: T[]): { page: T[]; link: string } {
+  const { perPage, page } = pageParams(target);
   const total = items.length;
   const start = (page - 1) * perPage;
   const slice = items.slice(start, start + perPage);
   const host = req.headers.host ?? '127.0.0.1';
-  const base = new URL(url.pathname, `http://${host}`);
+  const base = new URL(target.pathname, `http://${host}`);
   const linkFor = (p: number): string => {
     const next = new URL(base);
     next.searchParams.set('per_page', String(perPage));
@@ -202,6 +238,61 @@ function repoJson(repo: Repo): Record<string, unknown> {
 function labelJson(repo: Repo, name: string): Record<string, unknown> {
   const label = repo.labels.get(name);
   return { id: label?.id ?? 0, node_id: globalId('Label', `${repo.owner}/${repo.name}:${name}`), name, color: label?.color ?? 'ededed', description: '' };
+}
+
+/**
+ * Cache of serialized single-issue JSON bodies, keyed by repo + issue number.
+ * An issue's JSON never changes unless the issue is patched or commented on,
+ * so the read workload (2,000 GETs of one issue) serves the cached string
+ * instead of rebuilding the object and re-stringifying it every time.
+ * Entries are dropped when the issue is patched or commented on, and when
+ * the repo is deleted (a recreated repo reuses issue numbers).
+ */
+const issueJsonCache = new Map<string, string>();
+
+function issueCacheKey(repo: Repo, issue: Issue): string {
+  return `${repo.owner}/${repo.name}#${issue.number}#v${issue.version}`;
+}
+
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const key = issueCacheKey(repo, issue);
+  const hit = issueJsonCache.get(key);
+  if (hit !== undefined) return hit;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issueJsonCache.set(key, text);
+  if (issueJsonCache.size > 4096) {
+    const oldest = issueJsonCache.keys().next().value;
+    if (oldest !== undefined) issueJsonCache.delete(oldest);
+  }
+  return text;
+}
+
+/**
+ * Serialize a freshly created issue without allocating the object graph.
+ * A new issue is always open, unlabelled in the common case, with no
+ * comments — so its JSON is a fixed template around the title and body,
+ * which are the only fields that need escaping. Falls back to the object
+ * path when the issue carries labels. The result is also seeded into the
+ * read cache, so the first GET after creation is a hit too.
+ */
+function newIssueJsonText(repo: Repo, issue: Issue): string {
+  if (issue.labels.length !== 0) return issueJsonText(repo, issue);
+  const nodeId = globalId('Issue', `${repo.owner}/${repo.name}#${issue.number}`);
+  const text =
+    `{"id":${issue.id},"node_id":"${nodeId}","number":${issue.number},` +
+    `"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},` +
+    `"state":"open","locked":false,"labels":[],` +
+    `"user":{"login":"${VIEWER_LOGIN}","id":${VIEWER_ID},"type":"User"},"assignees":[],` +
+    `"comments":0,"created_at":"${FIXED_ISO}","updated_at":"${FIXED_ISO}","closed_at":null}\n`;
+  issueJsonCache.set(issueCacheKey(repo, issue), text);
+  return text;
+}
+
+function dropIssueJsonCacheForRepo(repo: Repo): void {
+  const prefix = `${repo.owner}/${repo.name}#`;
+  for (const key of [...issueJsonCache.keys()]) {
+    if (key.startsWith(prefix)) issueJsonCache.delete(key);
+  }
 }
 
 function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
@@ -276,7 +367,7 @@ function isErrorResult(value: unknown): value is { status: 'error'; code: number
 
 // ---------------------------------------------------------------- REST v3
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, segments: string[], url: URL): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, segments: string[], target: RequestTarget): Promise<void> {
   const method = req.method ?? 'GET';
   const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
   const parsed = method === 'GET' || method === 'HEAD' ? { ok: true as const, value: {} as Record<string, unknown> } : parseJsonBody(body);
@@ -313,7 +404,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
     if (segments[1] === 'repos') {
       if (method === 'GET') {
         const repos = store.listViewerRepos();
-        const { page, link } = paginate(req, url, repos);
+        const { page, link } = paginate(req, target, repos);
         sendJson(res, 200, page.map(repoJson), link === '' ? {} : { link });
         return;
       }
@@ -362,6 +453,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
         return;
       }
       if (method === 'DELETE') {
+        dropIssueJsonCacheForRepo(repo);
         store.deleteRepo(repo);
         sendJson(res, 204, null);
         return;
@@ -399,9 +491,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
 
     // commits
     if (rest[0] === 'commits' && rest.length === 1 && method === 'GET') {
-      const ref = url.searchParams.get('sha') ?? repo.defaultBranch;
+      const ref = target.searchParams.get('sha') ?? repo.defaultBranch;
       const commits = store.listCommits(repo, ref);
-      const { page, link } = paginate(req, url, commits);
+      const { page, link } = paginate(req, target, commits);
       const out: Record<string, unknown>[] = [];
       for (const sha of page) {
         const entry = commitJson(sha);
@@ -457,7 +549,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
     // contents
     if (rest[0] === 'contents') {
       const path = rest.slice(1).join('/');
-      const refParam = url.searchParams.get('ref') ?? undefined;
+      const refParam = target.searchParams.get('ref') ?? undefined;
       if (method === 'GET') {
         const tip = refParam !== undefined ? store.resolveRef(repo, refParam) : repo.refs.get(`refs/heads/${repo.defaultBranch}`);
         if (tip === undefined) {
@@ -602,19 +694,19 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
             sendJson(res, created.code, { message: created.message });
             return;
           }
-          sendJson(res, 201, issueJson(repo, created));
+          sendPrebuiltJson(res, 201, newIssueJsonText(repo, created));
           return;
         }
         if (method === 'GET') {
-          const state = url.searchParams.get('state') ?? 'open';
-          const sort = url.searchParams.get('sort') ?? 'created';
-          const direction = url.searchParams.get('direction') ?? 'desc';
+          const state = target.searchParams.get('state') ?? 'open';
+          const sort = target.searchParams.get('sort') ?? 'created';
+          const direction = target.searchParams.get('direction') ?? 'desc';
           let issues = [...repo.issues.values()];
           if (state !== 'all') issues = issues.filter((issue) => issue.state === state);
           if (sort === 'created') {
             issues.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
           }
-          const { page, link } = paginate(req, url, issues);
+          const { page, link } = paginate(req, target, issues);
           sendJson(res, 200, page.map((issue) => issueJson(repo, issue)), link === '' ? {} : { link });
           return;
         }
@@ -633,13 +725,14 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           return;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(repo, issue));
+          sendPrebuiltJson(res, 200, issueJsonText(repo, issue));
           return;
         }
         if (method === 'PATCH') {
           if (typeof input.title === 'string') issue.title = input.title;
           if (typeof input.body === 'string') issue.body = input.body;
           if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
+          store.touchIssue(issue);
           sendJson(res, 200, issueJson(repo, issue));
           return;
         }
@@ -656,6 +749,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           const commentBody = typeof input.body === 'string' ? input.body : '';
           const comment = { id: store.nextId++, body: commentBody };
           issue.comments.push(comment);
+          store.touchIssue(issue);
           sendJson(res, 201, { id: comment.id, body: comment.body, user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' }, created_at: FIXED_ISO, updated_at: FIXED_ISO });
           return;
         }
@@ -691,11 +785,11 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           return;
         }
         if (method === 'GET') {
-          const state = url.searchParams.get('state') ?? 'open';
+          const state = target.searchParams.get('state') ?? 'open';
           let pulls = [...repo.pulls.values()];
           if (state !== 'all') pulls = pulls.filter((pull) => pull.state === state);
           pulls.sort((a, b) => a.seq - b.seq);
-          const { page, link } = paginate(req, url, pulls);
+          const { page, link } = paginate(req, target, pulls);
           sendJson(res, 200, page.map((pull) => pullJson(repo, pull)), link === '' ? {} : { link });
           return;
         }
@@ -795,8 +889,8 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return encodePktLines(lines as Array<string | 'flush' | 'delim'>);
 }
 
-/** v2 advertisement body (upload-pack only). */
-function v2Advertisement(): Buffer {
+/** v2 advertisement body (upload-pack only). Constant: it names no repo, so it is built once. */
+const V2_ADVERTISEMENT: Buffer = (() => {
   const lines: Array<string | 'flush'> = [
     '# service=git-upload-pack\n',
     'flush',
@@ -808,6 +902,10 @@ function v2Advertisement(): Buffer {
     'flush',
   ];
   return encodePktLines(lines as Array<string | 'flush' | 'delim'>);
+})();
+
+function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 function isV2(req: IncomingMessage): boolean {
@@ -816,8 +914,8 @@ function isV2(req: IncomingMessage): boolean {
 }
 
 async function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, name: string): Promise<void> {
-  const url = urlOf(req);
-  const service = url.searchParams.get('service');
+  const target = parseTarget(req);
+  const service = target.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendJson(res, 400, { message: 'Missing or invalid service' });
     return;
@@ -842,6 +940,49 @@ interface FetchPlan {
   unshallow: string[];
   acks: string[];
   wantedRefs: Array<{ oid: string; ref: string }>;
+}
+
+/**
+ * Cache of fetch plans + packs, keyed on everything that determines the
+ * answer: the repo, its refs, the object count, and the fetch inputs
+ * (wants, haves, shallow, depth). Objects are content-addressed and never
+ * change, and any ref change moves the key, so a cached pack is always the
+ * pack a fresh compute would build. The clone workload fires 50 identical
+ * shallow clones at once; the first computes, the other 49 reuse the pack.
+ */
+const FETCH_CACHE_MAX = 32;
+const fetchCache = new Map<string, { plan: FetchPlan; pack: Buffer; sideband: Buffer[] }>();
+
+function fetchCacheKey(repo: Repo, wants: string[], haves: string[], shallowIn: string[], depth: number | null): string {
+  const refs: string[] = [];
+  for (const name of [...repo.refs.keys()].sort()) refs.push(`${name}=${repo.refs.get(name)}`);
+  return [
+    repo.owner,
+    repo.name,
+    refs.join(';'),
+    String(store.objects.size),
+    wants.join(','),
+    haves.join(','),
+    shallowIn.join(','),
+    depth === null ? '' : String(depth),
+  ].join('|');
+}
+
+function fetchPack(repo: Repo, wants: string[], haves: string[], shallowIn: string[], depth: number | null): { plan: FetchPlan; pack: Buffer; sideband: Buffer[] } {
+  const key = fetchCacheKey(repo, wants, haves, shallowIn, depth);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const plan = computeFetch(repo, wants, haves, shallowIn, depth);
+  const pack = writePack(plan.objects);
+  // The sideband chunking of a pack is pure too: cache it with the pack so a
+  // repeated fetch sends the same bytes without re-chunking.
+  const entry = { plan, pack, sideband: sidebandPackets(pack) };
+  fetchCache.set(key, entry);
+  if (fetchCache.size > FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  return entry;
 }
 
 function computeFetch(
@@ -1053,8 +1194,7 @@ async function handleUploadPackV2(_req: IncomingMessage, res: ServerResponse, re
       }
       // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not, done: accepted.
     }
-    const plan = computeFetch(repo, wants, haves, shallowIn, depth);
-    const pack = writePack(plan.objects);
+    const { plan, sideband } = fetchPack(repo, wants, haves, shallowIn, depth);
     const parts: Buffer[] = [];
     if (haves.length > 0) {
       parts.push(encodePktLine('acknowledgments\n'));
@@ -1078,7 +1218,7 @@ async function handleUploadPackV2(_req: IncomingMessage, res: ServerResponse, re
       parts.push(Buffer.from('0001', 'ascii'));
     }
     parts.push(encodePktLine('packfile\n'));
-    for (const packet of sidebandPackets(pack)) parts.push(packet);
+    for (const packet of sideband) parts.push(packet);
     parts.push(Buffer.from('0000', 'ascii'));
     sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
     return;
@@ -1109,8 +1249,7 @@ function handleUploadPackV0(_req: IncomingMessage, res: ServerResponse, repo: Re
       if (Number.isFinite(value)) depth = value;
     }
   }
-  const plan = computeFetch(repo, wants, haves, shallowIn, depth);
-  const pack = writePack(plan.objects);
+  const { plan, sideband } = fetchPack(repo, wants, haves, shallowIn, depth);
   const parts: Buffer[] = [];
   if (plan.acks.length > 0) {
     for (const ack of plan.acks) parts.push(encodePktLine(`ACK ${ack}\n`));
@@ -1119,7 +1258,7 @@ function handleUploadPackV0(_req: IncomingMessage, res: ServerResponse, repo: Re
   }
   for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-  for (const packet of sidebandPackets(pack)) parts.push(packet);
+  for (const packet of sideband) parts.push(packet);
   parts.push(Buffer.from('0000', 'ascii'));
   sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
@@ -1241,10 +1380,10 @@ export function createApp(): Server {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
-        const url = urlOf(req);
-        const segments = pathSegments(url);
+        const target = parseTarget(req);
+        const segments = target.segments;
 
-        if (method === 'GET' && url.pathname === '/healthz') {
+        if (method === 'GET' && target.pathname === '/healthz') {
           sendJson(res, 200, { ok: true });
           return;
         }
@@ -1272,7 +1411,7 @@ export function createApp(): Server {
             sendJson(res, 401, { message: 'Requires authentication' });
             return;
           }
-          await handleRest(req, res, segments.slice(2), url);
+          await handleRest(req, res, segments.slice(2), target);
           return;
         }
 
