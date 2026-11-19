@@ -595,6 +595,7 @@ function resolveField(ctx: Ctx, parent: GqlValue, field: Selection): unknown {
         return null;
       }
       issue.state = 'closed';
+      store.touchIssue(issue);
       return { __t: 'CloseIssuePayload', issue: issueValue(store, repo, issue) };
     }
     if (name === 'createPullRequest') {
@@ -656,6 +657,7 @@ function resolveField(ctx: Ctx, parent: GqlValue, field: Selection): unknown {
       }
       const comment = { id: store.nextId++, body: String(input.body ?? '') };
       issue.comments.push(comment);
+      store.touchIssue(issue);
       const node: GqlValue = {
         __t: 'IssueComment',
         id: globalId('IssueComment', `${repo.owner}/${repo.name}#${issue.number}#${comment.id}`),
