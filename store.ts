@@ -429,6 +429,8 @@ export interface Issue {
   labels: string[];
   comments: IssueComment[];
   seq: number;
+  /** Bumped on every mutation (REST, GraphQL, MCP): caches key off it, so a changed issue is never served stale. */
+  version: number;
 }
 
 export interface Pull {
@@ -851,9 +853,15 @@ export class ForgeStore {
       labels: [...labelNames],
       comments: [],
       seq: number,
+      version: 0,
     };
     repo.issues.set(number, issue);
     return issue;
+  }
+
+  /** Mark an issue changed (any endpoint): bumps its version so cached serializations miss. */
+  touchIssue(issue: Issue): void {
+    issue.version += 1;
   }
 
   // ---------------------------------------------------------- pulls
