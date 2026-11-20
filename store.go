@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -81,12 +82,18 @@ func sha1Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// objHeader builds the "<type> <size>\x00" prefix of a git object id.
+func objHeader(typ string, size int) []byte {
+	buf := make([]byte, 0, len(typ)+21)
+	buf = append(buf, typ...)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(size), 10)
+	buf = append(buf, 0)
+	return buf
+}
+
 func (s *objectStore) hashObject(typ string, data []byte) string {
-	header := fmt.Sprintf("%s %d\x00", typ, len(data))
-	buf := make([]byte, 0, len(header)+len(data))
-	buf = append(buf, header...)
-	buf = append(buf, data...)
-	return sha1Hex(buf)
+	return hashObjectRaw(typ, data)
 }
 
 func (s *objectStore) addObject(typ string, data []byte) string {
@@ -354,21 +361,65 @@ func (r *sliceReader) ReadByte() (byte, error) {
 	return c, nil
 }
 
+// zlibReaders pools zlib stream readers: a pack holds one stream per
+// entry, and rebuilding the flate decoder for each is pure overhead. A
+// reader goes back only after a clean, fully drained stream; Reset then
+// rebinds it to the next entry's bytes.
+var zlibReaders sync.Pool
+
+type zlibResetter interface {
+	Reset(io.Reader, []byte) error
+}
+
 func inflateEntry(pack []byte, offset int, expectedSize int) ([]byte, int, error) {
 	r := &sliceReader{b: pack, pos: offset}
-	zr, err := zlib.NewReader(r)
-	if err != nil {
-		return nil, 0, err
+	var zr io.ReadCloser
+	if pooled := zlibReaders.Get(); pooled != nil {
+		candidate := pooled.(io.ReadCloser)
+		if rs, ok := candidate.(zlibResetter); ok {
+			if err := rs.Reset(r, nil); err == nil {
+				zr = candidate
+			}
+		}
 	}
-	defer zr.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, zr); err != nil {
-		return nil, 0, err
+	if zr == nil {
+		fresh, err := zlib.NewReader(r)
+		if err != nil {
+			return nil, 0, err
+		}
+		zr = fresh
 	}
-	if buf.Len() != expectedSize {
-		return nil, 0, fmt.Errorf("inflated size %d, want %d", buf.Len(), expectedSize)
+	// Inflate straight into a buffer pre-sized to the entry's declared
+	// size (growing past it only for a corrupt stream, which the size
+	// check below then rejects, exactly as a full drain + compare did).
+	buf := make([]byte, 0, expectedSize)
+	var readErr error
+	for {
+		if len(buf) == cap(buf) {
+			grown := make([]byte, len(buf), 2*cap(buf)+512)
+			copy(grown, buf)
+			buf = grown
+		}
+		n, err := zr.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			readErr = err
+			break
+		}
 	}
-	return buf.Bytes(), r.pos, nil
+	if readErr != nil {
+		_ = zr.Close()
+		return nil, 0, readErr
+	}
+	if len(buf) != expectedSize {
+		_ = zr.Close()
+		return nil, 0, fmt.Errorf("inflated size %d, want %d", len(buf), expectedSize)
+	}
+	zlibReaders.Put(zr)
+	return buf, r.pos, nil
 }
 
 // readPack parses a packfile and returns the fully resolved objects keyed by
@@ -380,8 +431,8 @@ func readPack(pack []byte, lookup func(oid string) *gitObject) (map[string]*gitO
 	}
 	count := int(pack[8])<<24 | int(pack[9])<<16 | int(pack[10])<<8 | int(pack[11])
 	offset := 12
-	var entries []*packEntry
-	byOffset := make(map[int]int)
+	entries := make([]*packEntry, 0, count)
+	byOffset := make(map[int]int, count)
 	for i := 0; i < count; i++ {
 		if offset >= len(pack) {
 			return nil, errors.New("pack truncated in entry header")
@@ -505,11 +556,11 @@ func readPack(pack []byte, lookup func(oid string) *gitObject) (map[string]*gitO
 
 // hashObjectRaw computes an object's id without a store instance.
 func hashObjectRaw(typ string, data []byte) string {
-	header := fmt.Sprintf("%s %d\x00", typ, len(data))
 	h := sha1.New()
-	h.Write([]byte(header))
+	h.Write(objHeader(typ, len(data)))
 	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:])
 }
 
 // applyDelta applies a git delta (copy/insert program) to a base object.
@@ -589,6 +640,11 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 	return out, nil
 }
 
+// packWriters pools the level-1 zlib writers writePack deflates with:
+// one stream per object, Reset between objects, instead of a fresh flate
+// compressor (and its window buffers) per object.
+var packWriters sync.Pool
+
 // writePack serializes objects as a version-2 pack of plain (undeltified)
 // entries, zlib level 1 — the fastest setting that stays cheap to inflate.
 func writePack(objects []*gitObject) []byte {
@@ -597,6 +653,12 @@ func writePack(objects []*gitObject) []byte {
 	writeU32(&buf, 2)
 	writeU32(&buf, uint32(len(objects)))
 	var scratch bytes.Buffer
+	var zw *zlib.Writer
+	if pooled := packWriters.Get(); pooled != nil {
+		zw = pooled.(*zlib.Writer)
+	} else {
+		zw, _ = zlib.NewWriterLevel(&scratch, 1)
+	}
 	for _, obj := range objects {
 		code := packTypeCodes[obj.typ]
 		size := len(obj.data)
@@ -609,11 +671,12 @@ func writePack(objects []*gitObject) []byte {
 		}
 		buf.WriteByte(first)
 		scratch.Reset()
-		zw, _ := zlib.NewWriterLevel(&scratch, 1)
+		zw.Reset(&scratch)
 		_, _ = zw.Write(obj.data)
 		_ = zw.Close()
 		buf.Write(scratch.Bytes())
 	}
+	packWriters.Put(zw)
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
 	return buf.Bytes()
@@ -633,6 +696,28 @@ func writeU32(buf *bytes.Buffer, v uint32) {
 func pktLine(payload string) []byte {
 	length := len(payload) + 4
 	return []byte(fmt.Sprintf("%04x%s", length, payload))
+}
+
+const pktHexDigits = "0123456789abcdef"
+
+// appendPktLine frames payload as one pkt-line appended to dst: the
+// 4-hex-digit length prefix (payload + 4) then the payload bytes, with
+// none of the string conversions or formatting pktLine pays for.
+func appendPktLine(dst, payload []byte) []byte {
+	n := len(payload) + 4
+	dst = append(dst,
+		pktHexDigits[(n>>12)&0xf], pktHexDigits[(n>>8)&0xf],
+		pktHexDigits[(n>>4)&0xf], pktHexDigits[n&0xf])
+	return append(dst, payload...)
+}
+
+// appendPktText is appendPktLine for a string payload.
+func appendPktText(dst []byte, payload string) []byte {
+	n := len(payload) + 4
+	dst = append(dst,
+		pktHexDigits[(n>>12)&0xf], pktHexDigits[(n>>8)&0xf],
+		pktHexDigits[(n>>4)&0xf], pktHexDigits[n&0xf])
+	return append(dst, payload...)
 }
 
 func pktFlush() []byte { return []byte("0000") }
@@ -698,18 +783,20 @@ func sidebandPackets(pack []byte) []byte {
 	if len(pack) == 0 {
 		return pktLine("\x01")
 	}
-	var out bytes.Buffer
+	out := make([]byte, 0, len(pack)+5*(len(pack)/32768+1))
 	for start := 0; start < len(pack); start += 32768 {
 		end := start + 32768
 		if end > len(pack) {
 			end = len(pack)
 		}
-		chunk := make([]byte, 0, end-start+1)
-		chunk = append(chunk, 1)
-		chunk = append(chunk, pack[start:end]...)
-		out.Write(pktLine(string(chunk)))
+		n := end - start + 1 + 4 // band byte + length prefix
+		out = append(out,
+			pktHexDigits[(n>>12)&0xf], pktHexDigits[(n>>8)&0xf],
+			pktHexDigits[(n>>4)&0xf], pktHexDigits[n&0xf])
+		out = append(out, 1)
+		out = append(out, pack[start:end]...)
 	}
-	return out.Bytes()
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +850,7 @@ type pull struct {
 
 type issueCacheEntry struct {
 	version int
-	text    string
+	body    []byte // the rendered issue JSON, trailing newline included
 }
 
 type repo struct {

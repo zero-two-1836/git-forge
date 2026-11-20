@@ -59,29 +59,29 @@ func (s *store) v0Advertisement(r *repo, service string) []byte {
 		caps = receivePackCaps
 	}
 	refs := r.sortedRefs()
-	var out bytes.Buffer
-	out.Write(pktLine("# service=" + service + "\n"))
-	out.Write(pktFlush())
+	out := make([]byte, 0, 128+len(refs)*96)
+	out = appendPktText(out, "# service="+service+"\n")
+	out = append(out, pktFlush()...)
 	mainTip := r.refs["refs/heads/main"]
 	if len(refs) == 0 {
-		out.Write(pktLine(zeroOid + " capabilities^{}\x00" + caps + "\n"))
+		out = appendPktText(out, zeroOid+" capabilities^{}\x00"+caps+"\n")
 	} else {
 		head := mainTip
 		if head == "" {
 			head = zeroOid
 		}
-		out.Write(pktLine(head + " HEAD\x00" + caps + "\n"))
+		out = appendPktText(out, head+" HEAD\x00"+caps+"\n")
 		for _, ref := range refs {
-			out.Write(pktLine(ref[1] + " " + ref[0] + "\n"))
+			out = appendPktText(out, ref[1]+" "+ref[0]+"\n")
 		}
 		for _, ref := range refs {
 			if peeled := s.peelOf(r, ref[0], ref[1]); peeled != "" {
-				out.Write(pktLine(peeled + " " + ref[0] + "^{}\n"))
+				out = appendPktText(out, peeled+" "+ref[0]+"^{}\n")
 			}
 		}
 	}
-	out.Write(pktFlush())
-	return out.Bytes()
+	out = append(out, pktFlush()...)
+	return out
 }
 
 // collectDataLines decodes a pkt-line stream and returns the payloads of its
@@ -175,7 +175,7 @@ func (s *store) lsRefs(r *repo, lines []string) []byte {
 		}
 		return false
 	}
-	var out bytes.Buffer
+	out := make([]byte, 0, 256)
 	mainTip := r.refs["refs/heads/main"]
 	if keep("HEAD") {
 		if mainTip != "" {
@@ -183,9 +183,9 @@ func (s *store) lsRefs(r *repo, lines []string) []byte {
 			if symrefs {
 				line += " symref-target:refs/heads/main"
 			}
-			out.Write(pktLine(line + "\n"))
+			out = appendPktText(out, line+"\n")
 		} else if unborn {
-			out.Write(pktLine("unborn HEAD symref-target:refs/heads/main\n"))
+			out = appendPktText(out, "unborn HEAD symref-target:refs/heads/main\n")
 		}
 	}
 	for _, ref := range r.sortedRefs() {
@@ -198,10 +198,10 @@ func (s *store) lsRefs(r *repo, lines []string) []byte {
 				line += " peeled:" + peeled
 			}
 		}
-		out.Write(pktLine(line + "\n"))
+		out = appendPktText(out, line+"\n")
 	}
-	out.Write(pktFlush())
-	return out.Bytes()
+	out = append(out, pktFlush()...)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +218,40 @@ type fetchPlan struct {
 type fetchOutcome struct {
 	plan     fetchPlan
 	sideband []byte
+
+	// The assembled wire responses, built once per outcome: a fetch's
+	// answer is a function of the plan and the sideband alone (the v2
+	// acknowledgments section depends only on whether the request had
+	// haves), so repeat fetches — the clone benchmark's fifty — serve the
+	// cached bytes instead of re-framing the pack every time.
+	asmMu      sync.Mutex
+	asmV0      []byte
+	asmV2Ack   []byte
+	asmV2NoAck []byte
+}
+
+func (o *fetchOutcome) assembledV0() []byte {
+	o.asmMu.Lock()
+	defer o.asmMu.Unlock()
+	if o.asmV0 == nil {
+		o.asmV0 = buildFetchV0(o)
+	}
+	return o.asmV0
+}
+
+func (o *fetchOutcome) assembledV2(withAck bool) []byte {
+	o.asmMu.Lock()
+	defer o.asmMu.Unlock()
+	if withAck {
+		if o.asmV2Ack == nil {
+			o.asmV2Ack = buildFetchV2(o, true)
+		}
+		return o.asmV2Ack
+	}
+	if o.asmV2NoAck == nil {
+		o.asmV2NoAck = buildFetchV2(o, false)
+	}
+	return o.asmV2NoAck
 }
 
 // fetchCache memoizes fetch outcomes. The key carries the owner, the repo,
@@ -485,65 +519,67 @@ func parseFetchArgs(lines []string, v0 bool) (wants, haves, shallowIn []string, 
 	return wants, haves, shallowIn, depth
 }
 
-// assembleFetchV2 renders the protocol v2 fetch response sections.
-func assembleFetchV2(outcome *fetchOutcome, haves []string) []byte {
+// buildFetchV2 renders the protocol v2 fetch response sections; withAck
+// says the request carried haves, which is all that gates the
+// acknowledgments section.
+func buildFetchV2(outcome *fetchOutcome, withAck bool) []byte {
 	plan := outcome.plan
-	var out bytes.Buffer
-	if len(haves) > 0 {
-		out.Write(pktLine("acknowledgments\n"))
+	out := make([]byte, 0, len(outcome.sideband)+256)
+	if withAck {
+		out = appendPktText(out, "acknowledgments\n")
 		if len(plan.acks) > 0 {
 			for _, ack := range plan.acks {
-				out.Write(pktLine("ACK " + ack + "\n"))
+				out = appendPktText(out, "ACK "+ack+"\n")
 			}
-			out.Write(pktLine("ready\n"))
+			out = appendPktText(out, "ready\n")
 		} else {
-			out.Write(pktLine("NAK\n"))
+			out = appendPktText(out, "NAK\n")
 		}
-		out.Write(pktDelim())
+		out = append(out, pktDelim()...)
 	}
 	if len(plan.shallow) > 0 || len(plan.unshallow) > 0 {
-		out.Write(pktLine("shallow-info\n"))
+		out = appendPktText(out, "shallow-info\n")
 		for _, oid := range plan.shallow {
-			out.Write(pktLine("shallow " + oid + "\n"))
+			out = appendPktText(out, "shallow "+oid+"\n")
 		}
 		for _, oid := range plan.unshallow {
-			out.Write(pktLine("unshallow " + oid + "\n"))
+			out = appendPktText(out, "unshallow "+oid+"\n")
 		}
-		out.Write(pktDelim())
+		out = append(out, pktDelim()...)
 	}
 	if len(plan.wantedRefs) > 0 {
-		out.Write(pktLine("wanted-refs\n"))
+		out = appendPktText(out, "wanted-refs\n")
 		for _, wr := range plan.wantedRefs {
-			out.Write(pktLine(wr[0] + " " + wr[1] + "\n"))
+			out = appendPktText(out, wr[0]+" "+wr[1]+"\n")
 		}
-		out.Write(pktDelim())
+		out = append(out, pktDelim()...)
 	}
-	out.Write(pktLine("packfile\n"))
-	out.Write(outcome.sideband)
-	out.Write(pktFlush())
-	return out.Bytes()
+	out = appendPktText(out, "packfile\n")
+	out = append(out, outcome.sideband...)
+	out = append(out, pktFlush()...)
+	return out
 }
 
-// assembleFetchV0 renders the protocol v0 fetch response.
-func assembleFetchV0(outcome *fetchOutcome) []byte {
+// buildFetchV0 renders the protocol v0 fetch response.
+func buildFetchV0(outcome *fetchOutcome) []byte {
 	plan := outcome.plan
-	var out bytes.Buffer
+	out := make([]byte, 0, len(outcome.sideband)+128)
 	if len(plan.acks) > 0 {
 		for _, ack := range plan.acks {
-			out.Write(pktLine("ACK " + ack + "\n"))
+			out = appendPktText(out, "ACK "+ack+"\n")
 		}
 	} else {
-		out.Write(pktLine("NAK\n"))
+		out = appendPktText(out, "NAK\n")
 	}
 	for _, oid := range plan.shallow {
-		out.Write(pktLine("shallow " + oid + "\n"))
+		out = appendPktText(out, "shallow "+oid+"\n")
 	}
 	for _, oid := range plan.unshallow {
-		out.Write(pktLine("unshallow " + oid + "\n"))
+		out = appendPktText(out, "unshallow "+oid+"\n")
 	}
-	out.Write(outcome.sideband)
-	out.Write(pktFlush())
-	return out.Bytes()
+	out = append(out, outcome.sideband...)
+	out = append(out, pktFlush()...)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -672,25 +708,24 @@ func (a *app) receivePack(r *repo, body []byte) ([]byte, bool) {
 		results = append(results, result{ref, true, ""})
 	}
 
-	var inner bytes.Buffer
+	inner := make([]byte, 0, 64+len(results)*64)
 	if unpackOK {
-		inner.Write(pktLine("unpack ok\n"))
+		inner = appendPktText(inner, "unpack ok\n")
 	} else {
-		inner.Write(pktLine("unpack " + unpackDetail + "\n"))
+		inner = appendPktText(inner, "unpack "+unpackDetail+"\n")
 	}
 	for _, res := range results {
 		if res.ok {
-			inner.Write(pktLine("ok " + res.ref + "\n"))
+			inner = appendPktText(inner, "ok "+res.ref+"\n")
 		} else {
-			inner.Write(pktLine("ng " + res.ref + " " + res.reason + "\n"))
+			inner = appendPktText(inner, "ng "+res.ref+" "+res.reason+"\n")
 		}
 	}
-	inner.Write(pktFlush())
+	inner = append(inner, pktFlush()...)
 	if !sideband {
-		return inner.Bytes(), true
+		return inner, true
 	}
-	var out bytes.Buffer
-	out.Write(sidebandPackets(inner.Bytes()))
-	out.Write(pktFlush())
-	return out.Bytes(), true
+	out := sidebandPackets(inner)
+	out = append(out, pktFlush()...)
+	return out, true
 }

@@ -14,45 +14,78 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
 // jsonString renders s as a JSON string literal, escaping only what
 // JSON.stringify escapes: quote, backslash and the control characters.
+// The scan is byte-wise (the common case is printable ASCII, copied in
+// runs); multi-byte runes pass through as their raw bytes, and an invalid
+// byte becomes U+FFFD, exactly what ranging over the string would yield.
 func jsonString(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 2)
 	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString("\\\"")
-		case '\\':
-			b.WriteString("\\\\")
-		case '\n':
-			b.WriteString("\\n")
-		case '\r':
-			b.WriteString("\\r")
-		case '\t':
-			b.WriteString("\\t")
-		case '\b':
-			b.WriteString("\\b")
-		case '\f':
-			b.WriteString("\\f")
-		default:
-			if r < 0x20 {
-				b.WriteString("\\u")
-				const digits = "0123456789abcdef"
-				b.WriteByte(digits[(r>>12)&0xf])
-				b.WriteByte(digits[(r>>8)&0xf])
-				b.WriteByte(digits[(r>>4)&0xf])
-				b.WriteByte(digits[r&0xf])
-			} else {
-				b.WriteRune(r)
-			}
+	start := 0 // start of the pending unescaped run
+	flush := func(end int) {
+		if end > start {
+			b.WriteString(s[start:end])
 		}
 	}
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < 0x80 {
+			var esc string
+			switch c {
+			case '"':
+				esc = "\\\""
+			case '\\':
+				esc = "\\\\"
+			case '\n':
+				esc = "\\n"
+			case '\r':
+				esc = "\\r"
+			case '\t':
+				esc = "\\t"
+			case '\b':
+				esc = "\\b"
+			case '\f':
+				esc = "\\f"
+			default:
+				if c < 0x20 {
+					flush(i)
+					b.WriteString("\\u00")
+					const digits = "0123456789abcdef"
+					b.WriteByte(digits[(c>>4)&0xf])
+					b.WriteByte(digits[c&0xf])
+					i++
+					start = i
+					continue
+				}
+				i++
+				continue
+			}
+			flush(i)
+			b.WriteString(esc)
+			i++
+			start = i
+			continue
+		}
+		// Multi-byte sequence: copy it verbatim when it is a valid rune;
+		// an invalid byte is replaced by U+FFFD, as WriteRune would do.
+		_, size := utf8.DecodeRuneInString(s[i:])
+		if size == 1 {
+			flush(i)
+			b.WriteString("\uFFFD")
+			i++
+			start = i
+			continue
+		}
+		i += size
+	}
+	flush(len(s))
 	b.WriteByte('"')
 	return b.String()
 }

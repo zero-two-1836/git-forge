@@ -9,7 +9,6 @@ package main
 
 import (
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -23,6 +22,7 @@ import (
 type app struct {
 	store   *store
 	token   string
+	bearer  string // the full expected Authorization header, precomputed
 	fetches *fetchCache
 	reqID   int64
 	// issueMu guards the per-repo issue JSON caches, which are written on
@@ -31,7 +31,7 @@ type app struct {
 }
 
 func newApp(s *store, token string) *app {
-	return &app{store: s, token: token, fetches: newFetchCache()}
+	return &app{store: s, token: token, bearer: "Bearer " + token, fetches: newFetchCache()}
 }
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,15 @@ func newApp(s *store, token string) *app {
 
 func (a *app) nextReqID() string {
 	n := atomic.AddInt64(&a.reqID, 1)
-	return fmt.Sprintf("req-%06d", n)
+	// "req-" + the counter zero-padded to at least 6 digits (%06d).
+	digits := strconv.AppendInt(nil, n, 10)
+	out := make([]byte, 0, 4+max(6, len(digits)))
+	out = append(out, "req-"...)
+	for i := len(digits); i < 6; i++ {
+		out = append(out, '0')
+	}
+	out = append(out, digits...)
+	return string(out)
 }
 
 func (a *app) sendJSON(w http.ResponseWriter, status int, value any) {
@@ -73,7 +81,7 @@ func (a *app) authed(r *http.Request) bool {
 	if a.token == "" {
 		return strings.HasPrefix(header, "Bearer ") && len(header) > len("Bearer ")
 	}
-	return header == "Bearer "+a.token
+	return header == a.bearer
 }
 
 // ---------------------------------------------------------------------------
@@ -103,10 +111,15 @@ func parseTarget(r *http.Request) *requestTarget {
 		}
 		segments = append(segments, part)
 	}
-	query := make(map[string]string)
-	for key, values := range r.URL.Query() {
-		if len(values) > 0 {
-			query[key] = values[0]
+	// Most requests carry no query string at all; the map stays nil then
+	// (every reader tolerates a nil map) and the parse is skipped.
+	var query map[string]string
+	if r.URL.RawQuery != "" {
+		query = make(map[string]string)
+		for key, values := range r.URL.Query() {
+			if len(values) > 0 {
+				query[key] = values[0]
+			}
 		}
 	}
 	return &requestTarget{pathname: pathname, segments: segments, query: query}
@@ -250,30 +263,31 @@ func issueJSONString(r *repo, iss *issue) string {
 	return b.String()
 }
 
-// issueJSONText is the cached single-issue body (object + newline), keyed
-// by the issue's version so a patch or comment renders afresh.
-func (a *app) issueJSONText(r *repo, iss *issue) string {
+// issueJSONBody is the cached single-issue body (object + newline), keyed
+// by the issue's version so a patch or comment renders afresh. The cache
+// holds the wire bytes so a hit is served with no re-render and no copy.
+func (a *app) issueJSONBody(r *repo, iss *issue) []byte {
 	a.issueMu.RLock()
 	hit, ok := r.issueJSON[iss.number]
 	a.issueMu.RUnlock()
 	if ok && hit.version == iss.version {
-		return hit.text
+		return hit.body
 	}
-	text := issueJSONString(r, iss) + "\n"
+	body := []byte(issueJSONString(r, iss) + "\n")
 	a.issueMu.Lock()
-	r.issueJSON[iss.number] = &issueCacheEntry{version: iss.version, text: text}
+	r.issueJSON[iss.number] = &issueCacheEntry{version: iss.version, body: body}
 	a.issueMu.Unlock()
-	return text
+	return body
 }
 
-// newIssueJSONText renders a freshly created issue: with no labels the body
+// newIssueJSONBody renders a freshly created issue: with no labels the body
 // is a fixed template around the escaped title and body; the result seeds
 // the read cache so the first GET after creation is a hit too.
-func (a *app) newIssueJSONText(r *repo, iss *issue) string {
+func (a *app) newIssueJSONBody(r *repo, iss *issue) []byte {
 	if len(iss.labels) != 0 {
-		return a.issueJSONText(r, iss)
+		return a.issueJSONBody(r, iss)
 	}
-	text := `{"id":` + itoa(iss.id) +
+	body := []byte(`{"id":` + itoa(iss.id) +
 		`,"node_id":` + jsonString(globalID("Issue", viewerLogin+"/"+r.name+"#"+itoa(iss.number))) +
 		`,"number":` + itoa(iss.number) +
 		`,"title":` + jsonString(iss.title) +
@@ -282,11 +296,11 @@ func (a *app) newIssueJSONText(r *repo, iss *issue) string {
 		`"user":{"login":` + jsonString(viewerLogin) + `,"id":` + itoa(viewerID) + `,"type":"User"},"assignees":[],` +
 		`"comments":0,"created_at":` + jsonString(fixedISO) +
 		`,"updated_at":` + jsonString(fixedISO) +
-		`,"closed_at":null}` + "\n"
+		`,"closed_at":null}` + "\n")
 	a.issueMu.Lock()
-	r.issueJSON[iss.number] = &issueCacheEntry{version: iss.version, text: text}
+	r.issueJSON[iss.number] = &issueCacheEntry{version: iss.version, body: body}
 	a.issueMu.Unlock()
-	return text
+	return body
 }
 
 func pullJSONString(s *store, r *repo, p *pull) string {
@@ -519,7 +533,7 @@ func (a *app) handleUploadPack(w http.ResponseWriter, r *http.Request, owner, na
 	}
 	wants, haves, shallowIn, depth := parseFetchArgs(lines, true)
 	outcome := a.fetchPack(repo, wants, haves, shallowIn, depth)
-	a.sendBytes(w, 200, "application/x-git-upload-pack-result", assembleFetchV0(outcome))
+	a.sendBytes(w, 200, "application/x-git-upload-pack-result", outcome.assembledV0())
 }
 
 func (a *app) uploadPackV2(w http.ResponseWriter, repo *repo, lines []string) {
@@ -533,7 +547,7 @@ func (a *app) uploadPackV2(w http.ResponseWriter, repo *repo, lines []string) {
 	case "command=fetch":
 		wants, haves, shallowIn, depth := parseFetchArgs(lines[1:], false)
 		outcome := a.fetchPack(repo, wants, haves, shallowIn, depth)
-		a.sendBytes(w, 200, "application/x-git-upload-pack-result", assembleFetchV2(outcome, haves))
+		a.sendBytes(w, 200, "application/x-git-upload-pack-result", outcome.assembledV2(len(haves) > 0))
 	default:
 		a.sendJSON(w, 400, map[string]any{"message": "Unknown v2 command"})
 	}
@@ -1068,7 +1082,7 @@ func (a *app) restIssues(w http.ResponseWriter, r *http.Request, repo *repo, res
 				a.sendForgeError(w, err)
 				return
 			}
-			a.sendPrebuilt(w, 201, a.newIssueJSONText(repo, created))
+			a.sendBytes(w, 201, "application/json; charset=utf-8", a.newIssueJSONBody(repo, created))
 			return
 		case "GET":
 			state := "open"
@@ -1128,7 +1142,7 @@ func (a *app) restIssues(w http.ResponseWriter, r *http.Request, repo *repo, res
 		}
 		switch method {
 		case "GET":
-			a.sendPrebuilt(w, 200, a.issueJSONText(repo, iss))
+			a.sendBytes(w, 200, "application/json; charset=utf-8", a.issueJSONBody(repo, iss))
 		case "PATCH":
 			if v, ok := input["title"].(string); ok {
 				iss.title = v
@@ -1140,7 +1154,7 @@ func (a *app) restIssues(w http.ResponseWriter, r *http.Request, repo *repo, res
 				iss.state = v
 			}
 			s.touchIssue(repo, iss)
-			a.sendPrebuilt(w, 200, a.issueJSONText(repo, iss))
+			a.sendBytes(w, 200, "application/json; charset=utf-8", a.issueJSONBody(repo, iss))
 		default:
 			a.notFound(w)
 		}
